@@ -1,22 +1,17 @@
 # genlevels.py
-# Generador de niveles "Rush Hour" (6x6) + solver BFS + export a TypeScript LevelDef[]
+# Generador de niveles "Rush Hour" (tableros configurables) + solver BFS + export a TypeScript LevelDef[]
 # Ejecuta:  python genlevels.py --difficulty easy --n-levels 10 > easy.out.ts
 
 import random
 import argparse
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict, Sequence
+from typing import Dict, List, Optional, Tuple
 
 # ---------------------------
 # Config base del tablero
 # ---------------------------
 
-BOARD_SIZE = 6
-
-# Player fijo, salida fija (coincide con tu juego)
 PLAYER_ID = "P"
-PLAYER = {"id": "P", "len": 2, "dir": "v", "x": 3, "y": 3, "asset": "player_len2_red"}
-EXIT = {"side": "top", "index": 3}
 
 ASSETS_BY_LEN = {
     2: ["car_len2_blue", "car_len2_gray"],
@@ -24,33 +19,8 @@ ASSETS_BY_LEN = {
     4: ["car_len4_red", "car_len4_yellow", "car_len4_gray"],
 }
 
-# Perfiles de dificultad (editables)
-PROFILES = {
-    "easy": {
-        "min_moves": 10, "max_moves": 16,
-        "num_pieces_range": (8, 12),
-        "cover_top_cells": 2,            # cuántas de (3,2),(3,1),(3,0) intentar cubrir
-        "lens_weights": (2, 6, 2),       # pesos para longitudes (2,3,4)
-        "dir_bias": (1.0, 1.0),          # (bias_h, bias_v) → 1:1 neutral
-        "seed": 2025,
-    },
-    "normal": {
-        "min_moves": 16, "max_moves": 24,
-        "num_pieces_range": (9, 13),
-        "cover_top_cells": 3,
-        "lens_weights": (1, 7, 2),
-        "dir_bias": (0.9, 1.1),          # leve sesgo a verticales
-        "seed": 2025,
-    },
-    "hard": {
-        "min_moves": 24, "max_moves": 36,
-        "num_pieces_range": (10, 14),
-        "cover_top_cells": 3,
-        "lens_weights": (1, 6, 3),       # más len=4
-        "dir_bias": (0.8, 1.2),          # más verticales para “atascar” columna
-        "seed": 2025,
-    },
-}
+# ---------------------------
+# Modelo de pieza
 
 # ---------------------------
 # Modelo de pieza
@@ -71,18 +41,88 @@ class Piece:
 def pieces_copy(lst: List[Piece]) -> List[Piece]:
     return [p.copy() for p in lst]
 
+
+@dataclass(frozen=True)
+class BoardContext:
+    board_size: int
+    exit_side: str
+    exit_index: int
+    player: Piece
+
+    def path_cells_to_exit(self) -> List[Tuple[int, int]]:
+        if self.exit_side != 'top':
+            raise NotImplementedError("Solo se soporta salida superior en esta versión")
+        cells: List[Tuple[int, int]] = []
+        x = self.exit_index
+        y = self.player.y - 1
+        while y >= 0:
+            cells.append((x, y))
+            y -= 1
+        return cells
+
+
+# Perfiles de dificultad (editables)
+PROFILES = {
+    "easy": {
+        "board_size": 6,
+        "player": {"id": PLAYER_ID, "len": 2, "dir": "v", "x": 3, "y": 3, "asset": "player_len2_red"},
+        "exit": {"side": "top", "index": 3},
+        "min_moves": 10,
+        "max_moves": 16,
+        "num_pieces_range": (8, 12),
+        "cover_top_cells": 2,
+        "lens_weights": (2, 6, 2),
+        "dir_bias": (1.0, 1.0),
+        "seed": 2025,
+        "level_prefix": "e",
+        "max_bfs_states": 200000,
+        "max_attempts": 8000,
+    },
+    "normal": {
+        "board_size": 7,
+        "player": {"id": PLAYER_ID, "len": 2, "dir": "v", "x": 3, "y": 5, "asset": "player_len2_red"},
+        "exit": {"side": "top", "index": 3},
+        "min_moves": 20,
+        "max_moves": 32,
+        "num_pieces_range": (10, 15),
+        "cover_top_cells": 4,
+        "lens_weights": (1, 7, 3),
+        "dir_bias": (0.9, 1.1),
+        "seed": 2025,
+        "level_prefix": "n",
+        "max_bfs_states": 400000,
+        "max_attempts": 15000,
+    },
+    "hard": {
+        "board_size": 6,
+        "player": {"id": PLAYER_ID, "len": 2, "dir": "v", "x": 3, "y": 3, "asset": "player_len2_red"},
+        "exit": {"side": "top", "index": 3},
+        "min_moves": 24,
+        "max_moves": 36,
+        "num_pieces_range": (10, 14),
+        "cover_top_cells": 3,
+        "lens_weights": (1, 6, 3),
+        "dir_bias": (0.8, 1.2),
+        "seed": 2025,
+        "level_prefix": "h",
+        "max_bfs_states": 250000,
+        "max_attempts": 12000,
+    },
+}
+
 # ---------------------------
 # Utilidades de tablero
 # ---------------------------
 
-def in_bounds(p: Piece) -> bool:
+def in_bounds(p: Piece, board_size: int) -> bool:
     if p.dir == 'h':
-        return 0 <= p.x <= BOARD_SIZE - p.len and 0 <= p.y < BOARD_SIZE
+        return 0 <= p.x <= board_size - p.len and 0 <= p.y < board_size
     else:
-        return 0 <= p.y <= BOARD_SIZE - p.len and 0 <= p.x < BOARD_SIZE
+        return 0 <= p.y <= board_size - p.len and 0 <= p.x < board_size
 
-def build_grid(pieces: List[Piece], ignore_id: Optional[str] = None) -> List[List[int]]:
-    g = [[-1]*BOARD_SIZE for _ in range(BOARD_SIZE)]
+
+def build_grid(pieces: List[Piece], board_size: int, ignore_id: Optional[str] = None) -> List[List[int]]:
+    g = [[-1] * board_size for _ in range(board_size)]
     for p in pieces:
         if ignore_id and p.id == ignore_id:
             continue
@@ -94,10 +134,11 @@ def build_grid(pieces: List[Piece], ignore_id: Optional[str] = None) -> List[Lis
                 g[p.y+dy][p.x] = p.len
     return g
 
-def overlap_free(pieces: List[Piece]) -> bool:
-    g = [[-1]*BOARD_SIZE for _ in range(BOARD_SIZE)]
+
+def overlap_free(pieces: List[Piece], board_size: int) -> bool:
+    g = [[-1] * board_size for _ in range(board_size)]
     for p in pieces:
-        if not in_bounds(p):
+        if not in_bounds(p, board_size):
             return False
         if p.dir == 'h':
             for dx in range(p.len):
@@ -119,6 +160,7 @@ def overlap_free(pieces: List[Piece]) -> bool:
 
 def slide_targets(grid: List[List[int]], p: Piece) -> List[int]:
     res = []
+    board_size = len(grid)
     if p.dir == 'h':
         # izquierda
         nx = p.x - 1
@@ -126,7 +168,7 @@ def slide_targets(grid: List[List[int]], p: Piece) -> List[int]:
             res.append(nx); nx -= 1
         # derecha (desde la cola)
         nx = p.x + 1
-        while (nx + p.len - 1) < BOARD_SIZE and grid[p.y][nx + p.len - 1] == -1:
+        while (nx + p.len - 1) < board_size and grid[p.y][nx + p.len - 1] == -1:
             res.append(nx); nx += 1
     else:
         # arriba
@@ -135,17 +177,17 @@ def slide_targets(grid: List[List[int]], p: Piece) -> List[int]:
             res.append(ny); ny -= 1
         # abajo (desde la cola)
         ny = p.y + 1
-        while (ny + p.len - 1) < BOARD_SIZE and grid[ny + p.len - 1][p.x] == -1:
+        while (ny + p.len - 1) < board_size and grid[ny + p.len - 1][p.x] == -1:
             res.append(ny); ny += 1
     return res
 
-def is_goal(pieces: List[Piece]) -> bool:
-    # Player vertical, salida top@x=3
+def is_goal(pieces: List[Piece], ctx: BoardContext) -> bool:
+    # Player vertical, salida top
     P = next((x for x in pieces if x.id == PLAYER_ID), None)
     if not P: return False
-    if P.dir != 'v' or P.x != EXIT["index"]:
+    if P.dir != 'v' or P.x != ctx.exit_index:
         return False
-    grid = build_grid(pieces, ignore_id=PLAYER_ID)
+    grid = build_grid(pieces, ctx.board_size, ignore_id=PLAYER_ID)
     # ¿hay camino libre hacia arriba?
     y = P.y - 1
     while y >= 0:
@@ -161,7 +203,7 @@ def encode(pieces: List[Piece], order: List[str], pos_idx: Dict[str,int]) -> str
         key[i+1] = p.y
     return ",".join(map(str,key))
 
-def solve_bfs(pieces_start: List[Piece]) -> Optional[Tuple[int, List[Tuple[str, Tuple[int,int], Tuple[int,int]]]]]:
+def solve_bfs(pieces_start: List[Piece], ctx: BoardContext, max_states: int = 300000) -> Optional[Tuple[int, List[Tuple[str, Tuple[int, int], Tuple[int, int]]]]]:
     """ Devuelve (visited, moves) o None si no hay solución.
         moves = [(pieceId, (fromx,fromy), (tox,toy)), ...] (óptimos)
     """
@@ -180,9 +222,11 @@ def solve_bfs(pieces_start: List[Piece]) -> Optional[Tuple[int, List[Tuple[str, 
 
     while head < len(q):
         key = q[head]; head += 1; visited += 1
+        if visited > max_states:
+            return None
         pieces = by_key[key]
 
-        if is_goal(pieces):
+        if is_goal(pieces, ctx):
             # reconstruir
             moves = []
             cur = key
@@ -197,7 +241,7 @@ def solve_bfs(pieces_start: List[Piece]) -> Optional[Tuple[int, List[Tuple[str, 
 
         # expandir
         for p in pieces:
-            grid = build_grid(pieces, ignore_id=p.id)
+            grid = build_grid(pieces, ctx.board_size, ignore_id=p.id)
             targets = slide_targets(grid, p)
             for t in targets:
                 nxt = pieces_copy(pieces)
@@ -225,18 +269,19 @@ def choose_dir(dir_bias: Tuple[float,float]) -> str:
     return H if r < bh else V
 
 def random_piece(pid: str,
-                 lens_weights: Tuple[int,int,int] = (2,6,2),
-                 dir_bias: Tuple[float,float] = (1.0,1.0)) -> Piece:
+                 board_size: int,
+                 lens_weights: Tuple[int, int, int] = (2, 6, 2),
+                 dir_bias: Tuple[float, float] = (1.0, 1.0)) -> Piece:
     lens = random.choices([2,3,4], weights=lens_weights, k=1)[0]
     dir_ = choose_dir(dir_bias)
     asset = random.choice(ASSETS_BY_LEN[lens])
 
     if dir_ == H:
-        x = random.randint(0, BOARD_SIZE - lens)
-        y = random.randint(0, BOARD_SIZE - 1)
+        x = random.randint(0, board_size - lens)
+        y = random.randint(0, board_size - 1)
     else:
-        x = random.randint(0, BOARD_SIZE - 1)
-        y = random.randint(0, BOARD_SIZE - lens)
+        x = random.randint(0, board_size - 1)
+        y = random.randint(0, board_size - lens)
 
     return Piece(pid, lens, dir_, x, y, asset)
 
@@ -246,26 +291,32 @@ def crosses_cell(p: Piece, cx: int, cy: int) -> bool:
     else:
         return (p.x == cx) and (p.y <= cy <= p.y + p.len - 1)
 
-def generate_candidate(num_pieces_range=(8,12),
+def generate_candidate(ctx: BoardContext,
+                       num_pieces_range: Tuple[int, int] = (8, 12),
                        cover_top_cells: int = 2,
-                       lens_weights: Tuple[int,int,int] = (2,6,2),
-                       dir_bias: Tuple[float,float] = (1.0,1.0)) -> List[Piece]:
+                       lens_weights: Tuple[int, int, int] = (2, 6, 2),
+                       dir_bias: Tuple[float, float] = (1.0, 1.0)) -> List[Piece]:
     """
     Genera una disposición SIN solapes.
-    - P fijo en (3,3).
-    - 'A' cruza (3,2).
-    - Intenta cubrir otras celdas (3,1) y (3,0) según cover_top_cells.
+    - P fijo según contexto.
+    - 'A' cruza la celda inmediatamente encima del jugador.
+    - Intenta cubrir más celdas camino a la salida según cover_top_cells.
     """
     target = random.randint(*num_pieces_range)
-    pieces: List[Piece] = [Piece(**PLAYER)]
+    pieces: List[Piece] = [ctx.player.copy()]
 
-    # 1) 'A' cruza (3,2)
+    column_cells = ctx.path_cells_to_exit()
+    if not column_cells:
+        return []
+
+    # 1) 'A' cruza primera celda
+    primary_cell = column_cells[0]
     ok = False
     for _ in range(300):
-        p = random_piece('A', lens_weights, dir_bias)
-        if crosses_cell(p, 3, 2):
+        p = random_piece('A', ctx.board_size, lens_weights, dir_bias)
+        if crosses_cell(p, *primary_cell):
             tmp = pieces_copy(pieces) + [p]
-            if overlap_free(tmp):
+            if overlap_free(tmp, ctx.board_size):
                 pieces.append(p); ok = True; break
     if not ok:
         return []
@@ -283,31 +334,31 @@ def generate_candidate(num_pieces_range=(8,12),
         placed = False
         for _ in range(300):
             pid = new_id()
-            q = random_piece(pid, lens_weights, dir_bias)
+            q = random_piece(pid, ctx.board_size, lens_weights, dir_bias)
             tmp = pieces_copy(pieces) + [q]
-            if overlap_free(tmp):
+            if overlap_free(tmp, ctx.board_size):
                 pieces.append(q); placed = True; break
         if not placed:
             return []  # descartar y reintentar nuevo candidato
 
-    # 3) refuerzo de bloqueos en (3,1) y (3,0)
-    must_cells = [(3,1), (3,0)]
-    random.shuffle(must_cells)
-    cells_needed = max(0, min(cover_top_cells-1, 2))  # ya cubrimos (3,2) con 'A'
-    for (cx,cy) in must_cells:
+    # 3) refuerzo de bloqueos sobre la columna de salida
+    extra_cells = column_cells[1:]
+    random.shuffle(extra_cells)
+    cells_needed = max(0, min(cover_top_cells - 1, len(extra_cells)))  # ya cubrimos la primera con 'A'
+    for (cx, cy) in extra_cells:
         if cells_needed <= 0: break
         if all(not crosses_cell(p, cx, cy) for p in pieces if p.id != PLAYER_ID):
             for _ in range(200):
                 pid = new_id()
-                q = random_piece(pid, lens_weights, dir_bias)
+                q = random_piece(pid, ctx.board_size, lens_weights, dir_bias)
                 if crosses_cell(q, cx, cy):
                     tmp = pieces_copy(pieces) + [q]
-                    if overlap_free(tmp):
+                    if overlap_free(tmp, ctx.board_size):
                         pieces.append(q); cells_needed -= 1; break
 
     return pieces
 
-def as_ts_level(id_str: str, pieces: List[Piece], difficulty: str) -> str:
+def as_ts_level(id_str: str, pieces: List[Piece], difficulty: str, ctx: BoardContext) -> str:
     def piece_to_ts(p: Piece) -> str:
         return ("{ id: '%s', len: %d, dir: '%s', x: %d, y: %d, asset: '%s' }"
                 % (p.id, p.len, p.dir, p.x, p.y, p.asset))
@@ -315,33 +366,39 @@ def as_ts_level(id_str: str, pieces: List[Piece], difficulty: str) -> str:
     return f"""\
 {{
     id: '{id_str}',
-    size: 6,
+    size: {ctx.board_size},
     difficulty: '{difficulty}',
-    exit: {{ side: 'top', index: 3 }},
+    exit: {{ side: '{ctx.exit_side}', index: {ctx.exit_index} }},
     pieces: [
             {pieces_ts}
     ],
 }}"""
 
-def make_levels(n_levels=10, seed=1234,
-                min_moves=10, max_moves=18,
-                num_pieces_range=(8,12),
-                cover_top_cells=2,
-                lens_weights=(2,6,2),
-                dir_bias=(1.0,1.0),
-                difficulty_label="easy",
-                max_attempts=10000) -> List[str]:
+def make_levels(ctx: BoardContext,
+                n_levels: int = 10,
+                seed: int = 1234,
+                min_moves: int = 10,
+                max_moves: int = 18,
+                num_pieces_range: Tuple[int, int] = (8, 12),
+                cover_top_cells: int = 2,
+                lens_weights: Tuple[int, int, int] = (2, 6, 2),
+                dir_bias: Tuple[float, float] = (1.0, 1.0),
+                difficulty_label: str = "easy",
+                level_prefix: str = "e",
+                max_bfs_states: int = 300000,
+                max_attempts: int = 10000) -> List[str]:
     random.seed(seed)
     out_ts_blocks: List[str] = []
     attempts = 0
+    ctx_max_states = max_bfs_states
 
     while len(out_ts_blocks) < n_levels and attempts < max_attempts:
         attempts += 1
-        pieces = generate_candidate(num_pieces_range, cover_top_cells, lens_weights, dir_bias)
+        pieces = generate_candidate(ctx, num_pieces_range, cover_top_cells, lens_weights, dir_bias)
         if not pieces:
             continue
         # solver
-        res = solve_bfs(pieces)
+        res = solve_bfs(pieces, ctx, max_states=ctx_max_states)
         if res is None:
             continue
         visited, moves = res
@@ -351,7 +408,14 @@ def make_levels(n_levels=10, seed=1234,
             continue
         # ordena por id para consistencia visual
         pieces_sorted = sorted(pieces, key=lambda p: (p.id != PLAYER_ID, p.id))
-        out_ts_blocks.append(as_ts_level(f"e{len(out_ts_blocks)+1:02d}", pieces_sorted, difficulty_label))
+        out_ts_blocks.append(
+            as_ts_level(
+                f"{level_prefix}{len(out_ts_blocks)+1:02d}",
+                pieces_sorted,
+                difficulty_label,
+                ctx,
+            )
+        )
 
     return out_ts_blocks
 
@@ -372,6 +436,8 @@ def parse_args():
     ap.add_argument("--cover-top-cells", type=int, choices=[0,1,2,3])
     ap.add_argument("--lens-weights", type=str, help="Pesos '2,6,2' para len (2,3,4)")
     ap.add_argument("--dir-bias", type=str, help="Bias 'h,v' (e.g. '1.0,1.2')")
+    ap.add_argument("--max-bfs-states", type=int, help="Límite de estados visitados por el solver")
+    ap.add_argument("--max-attempts", type=int, help="Intentos máximos por lote de generación")
     ap.add_argument("--outfile", type=str, default=None)
     return ap.parse_args()
 
@@ -397,8 +463,20 @@ if __name__ == "__main__":
         parts = [float(x) for x in args.dir_bias.split(",")]
         if len(parts) != 2: raise SystemExit("--dir-bias debe ser 'bh,bv'")
         prof["dir_bias"] = tuple(parts)
+    if args.max_bfs_states is not None:
+        prof["max_bfs_states"] = args.max_bfs_states
+    if args.max_attempts is not None:
+        prof["max_attempts"] = args.max_attempts
+
+    ctx = BoardContext(
+        board_size=prof["board_size"],
+        exit_side=prof["exit"]["side"],
+        exit_index=prof["exit"]["index"],
+        player=Piece(**prof["player"]),
+    )
 
     blocks = make_levels(
+        ctx=ctx,
         n_levels=args.n_levels,
         seed=prof["seed"],
         min_moves=prof["min_moves"],
@@ -408,6 +486,9 @@ if __name__ == "__main__":
         lens_weights=prof["lens_weights"],
         dir_bias=prof["dir_bias"],
         difficulty_label=args.difficulty,
+        level_prefix=prof.get("level_prefix", args.difficulty[0]),
+        max_bfs_states=prof.get("max_bfs_states", 300000),
+        max_attempts=prof.get("max_attempts", 10000),
     )
 
     out = []
