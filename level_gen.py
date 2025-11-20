@@ -2,8 +2,10 @@
 # Generador de niveles "Rush Hour" (tableros configurables) + solver BFS + export a TypeScript LevelDef[]
 # Ejecuta:  python genlevels.py --difficulty easy --n-levels 10 > easy.out.ts
 
-import random
 import argparse
+import random
+import sys
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -90,8 +92,8 @@ PROFILES = {
         "dir_bias": (0.9, 1.1),
         "seed": 2025,
         "level_prefix": "n",
-        "max_bfs_states": 400000,
-        "max_attempts": 15000,
+        "max_bfs_states": 450000,
+        "max_attempts": 18000,
     },
     "hard": {
         "board_size": 6,
@@ -105,8 +107,8 @@ PROFILES = {
         "dir_bias": (0.8, 1.2),
         "seed": 2025,
         "level_prefix": "h",
-        "max_bfs_states": 250000,
-        "max_attempts": 12000,
+        "max_bfs_states": 500000,
+        "max_attempts": 18000,
     },
 }
 
@@ -263,25 +265,28 @@ def solve_bfs(pieces_start: List[Piece], ctx: BoardContext, max_states: int = 30
 
 H = 'h'; V = 'v'
 
-def choose_dir(dir_bias: Tuple[float,float]) -> str:
+def choose_dir(dir_bias: Tuple[float,float], rng: Optional[random.Random] = None) -> str:
+    rnd = rng or random
     bh, bv = dir_bias
-    r = random.random() * (bh + bv)
+    r = rnd.random() * (bh + bv)
     return H if r < bh else V
 
 def random_piece(pid: str,
                  board_size: int,
                  lens_weights: Tuple[int, int, int] = (2, 6, 2),
-                 dir_bias: Tuple[float, float] = (1.0, 1.0)) -> Piece:
-    lens = random.choices([2,3,4], weights=lens_weights, k=1)[0]
-    dir_ = choose_dir(dir_bias)
-    asset = random.choice(ASSETS_BY_LEN[lens])
+                 dir_bias: Tuple[float, float] = (1.0, 1.0),
+                 rng: Optional[random.Random] = None) -> Piece:
+    rnd = rng or random
+    lens = rnd.choices([2,3,4], weights=lens_weights, k=1)[0]
+    dir_ = choose_dir(dir_bias, rnd)
+    asset = rnd.choice(ASSETS_BY_LEN[lens])
 
     if dir_ == H:
-        x = random.randint(0, board_size - lens)
-        y = random.randint(0, board_size - 1)
+        x = rnd.randint(0, board_size - lens)
+        y = rnd.randint(0, board_size - 1)
     else:
-        x = random.randint(0, board_size - 1)
-        y = random.randint(0, board_size - lens)
+        x = rnd.randint(0, board_size - 1)
+        y = rnd.randint(0, board_size - lens)
 
     return Piece(pid, lens, dir_, x, y, asset)
 
@@ -295,14 +300,17 @@ def generate_candidate(ctx: BoardContext,
                        num_pieces_range: Tuple[int, int] = (8, 12),
                        cover_top_cells: int = 2,
                        lens_weights: Tuple[int, int, int] = (2, 6, 2),
-                       dir_bias: Tuple[float, float] = (1.0, 1.0)) -> List[Piece]:
+                       dir_bias: Tuple[float, float] = (1.0, 1.0),
+                       rng: Optional[random.Random] = None) -> List[Piece]:
     """
     Genera una disposición SIN solapes.
     - P fijo según contexto.
     - 'A' cruza la celda inmediatamente encima del jugador.
     - Intenta cubrir más celdas camino a la salida según cover_top_cells.
     """
-    target = random.randint(*num_pieces_range)
+    rnd = rng or random
+
+    target = rnd.randint(*num_pieces_range)
     pieces: List[Piece] = [ctx.player.copy()]
 
     column_cells = ctx.path_cells_to_exit()
@@ -313,7 +321,7 @@ def generate_candidate(ctx: BoardContext,
     primary_cell = column_cells[0]
     ok = False
     for _ in range(300):
-        p = random_piece('A', ctx.board_size, lens_weights, dir_bias)
+        p = random_piece('A', ctx.board_size, lens_weights, dir_bias, rnd)
         if crosses_cell(p, *primary_cell):
             tmp = pieces_copy(pieces) + [p]
             if overlap_free(tmp, ctx.board_size):
@@ -334,7 +342,7 @@ def generate_candidate(ctx: BoardContext,
         placed = False
         for _ in range(300):
             pid = new_id()
-            q = random_piece(pid, ctx.board_size, lens_weights, dir_bias)
+            q = random_piece(pid, ctx.board_size, lens_weights, dir_bias, rnd)
             tmp = pieces_copy(pieces) + [q]
             if overlap_free(tmp, ctx.board_size):
                 pieces.append(q); placed = True; break
@@ -343,14 +351,14 @@ def generate_candidate(ctx: BoardContext,
 
     # 3) refuerzo de bloqueos sobre la columna de salida
     extra_cells = column_cells[1:]
-    random.shuffle(extra_cells)
+    rnd.shuffle(extra_cells)
     cells_needed = max(0, min(cover_top_cells - 1, len(extra_cells)))  # ya cubrimos la primera con 'A'
     for (cx, cy) in extra_cells:
         if cells_needed <= 0: break
         if all(not crosses_cell(p, cx, cy) for p in pieces if p.id != PLAYER_ID):
             for _ in range(200):
                 pid = new_id()
-                q = random_piece(pid, ctx.board_size, lens_weights, dir_bias)
+                q = random_piece(pid, ctx.board_size, lens_weights, dir_bias, rnd)
                 if crosses_cell(q, cx, cy):
                     tmp = pieces_copy(pieces) + [q]
                     if overlap_free(tmp, ctx.board_size):
@@ -386,25 +394,87 @@ def make_levels(ctx: BoardContext,
                 difficulty_label: str = "easy",
                 level_prefix: str = "e",
                 max_bfs_states: int = 300000,
-                max_attempts: int = 10000) -> List[str]:
+                max_attempts: int = 10000,
+                progress_interval: int = 500,
+                target_moves: Optional[int] = None) -> List[str]:
     random.seed(seed)
+    rng = random.Random(seed)
+
     out_ts_blocks: List[str] = []
     attempts = 0
     ctx_max_states = max_bfs_states
+    discard_counters = {
+        "empty": 0,
+        "trivial": 0,
+        "unsolved": 0,
+        "range": 0,
+    }
+
+    if target_moves is not None:
+        min_moves = max(min_moves, target_moves - 1)
+        max_moves = max(max_moves, target_moves + 2)
+        # refuerza bloqueos y longitud para niveles largos
+        cover_top_cells = max(cover_top_cells, 3)
+        lw0, lw1, lw2 = lens_weights
+        lens_weights = (lw0 + 1, max(1, lw1 - 1), lw2 + 1)
+        ctx_max_states = int(ctx_max_states * 1.3)
+
+    start_time = time.perf_counter()
+
+    def log_progress(force: bool = False) -> None:
+        if not progress_interval:
+            return
+        if (attempts % progress_interval != 0) and not force:
+            return
+        elapsed = time.perf_counter() - start_time
+        success_rate = (len(out_ts_blocks) / attempts) if attempts else 0.0
+        attempts_per_sec = attempts / elapsed if elapsed > 0 else 0.0
+        eta = None
+        if success_rate > 0 and attempts_per_sec > 0:
+            remaining_levels = max(0, n_levels - len(out_ts_blocks))
+            eta = (remaining_levels / success_rate) / attempts_per_sec
+        progress_pct = (len(out_ts_blocks) / n_levels * 100) if n_levels else 0
+        msg = [
+            f"PROGRESO {progress_pct:5.1f}%", \
+            f"niveles {len(out_ts_blocks)}/{n_levels}", \
+            f"intentos {attempts}/{max_attempts}", \
+            f"acierto {success_rate*100:4.2f}%", \
+            f"t={elapsed:0.1f}s",
+        ]
+        if eta is not None:
+            msg.append(f"eta~{eta:0.1f}s")
+        msg.append(
+            "descartes "
+            f"vacío={discard_counters['empty']} "
+            f"trivial={discard_counters['trivial']} "
+            f"sin_sol={discard_counters['unsolved']} "
+            f"rango={discard_counters['range']}"
+        )
+        sys.stderr.write(" | ".join(msg) + "\n")
 
     while len(out_ts_blocks) < n_levels and attempts < max_attempts:
         attempts += 1
-        pieces = generate_candidate(ctx, num_pieces_range, cover_top_cells, lens_weights, dir_bias)
+        pieces = generate_candidate(ctx, num_pieces_range, cover_top_cells, lens_weights, dir_bias, rng=rng)
         if not pieces:
+            discard_counters["empty"] += 1
+            log_progress()
+            continue
+        if is_goal(pieces, ctx):
+            discard_counters["trivial"] += 1
+            log_progress()
             continue
         # solver
         res = solve_bfs(pieces, ctx, max_states=ctx_max_states)
         if res is None:
+            discard_counters["unsolved"] += 1
+            log_progress()
             continue
         visited, moves = res
         mcount = len(moves)
         # filtra por dificultad
         if not (min_moves <= mcount <= max_moves):
+            discard_counters["range"] += 1
+            log_progress()
             continue
         # ordena por id para consistencia visual
         pieces_sorted = sorted(pieces, key=lambda p: (p.id != PLAYER_ID, p.id))
@@ -416,7 +486,9 @@ def make_levels(ctx: BoardContext,
                 ctx,
             )
         )
+        log_progress()
 
+    log_progress(force=True)
     return out_ts_blocks
 
 # ---------------------------
@@ -438,6 +510,8 @@ def parse_args():
     ap.add_argument("--dir-bias", type=str, help="Bias 'h,v' (e.g. '1.0,1.2')")
     ap.add_argument("--max-bfs-states", type=int, help="Límite de estados visitados por el solver")
     ap.add_argument("--max-attempts", type=int, help="Intentos máximos por lote de generación")
+    ap.add_argument("--progress-interval", type=int, default=500, help="Intentos entre reportes de progreso (0=off)")
+    ap.add_argument("--target-moves", type=int, help="Preset para sesgar hacia un número objetivo de movimientos")
     ap.add_argument("--outfile", type=str, default=None)
     return ap.parse_args()
 
@@ -489,6 +563,8 @@ if __name__ == "__main__":
         level_prefix=prof.get("level_prefix", args.difficulty[0]),
         max_bfs_states=prof.get("max_bfs_states", 300000),
         max_attempts=prof.get("max_attempts", 10000),
+        progress_interval=args.progress_interval,
+        target_moves=args.target_moves,
     )
 
     out = []
