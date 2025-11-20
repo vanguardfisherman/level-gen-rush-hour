@@ -3,6 +3,7 @@
 # Ejecuta:  python genlevels.py --difficulty easy --n-levels 10 > easy.out.ts
 
 import argparse
+import multiprocessing as mp
 import random
 import sys
 import time
@@ -301,7 +302,8 @@ def generate_candidate(ctx: BoardContext,
                        cover_top_cells: int = 2,
                        lens_weights: Tuple[int, int, int] = (2, 6, 2),
                        dir_bias: Tuple[float, float] = (1.0, 1.0),
-                       rng: Optional[random.Random] = None) -> List[Piece]:
+                       rng: Optional[random.Random] = None,
+                       hard_blocks: bool = False) -> List[Piece]:
     """
     Genera una disposición SIN solapes.
     - P fijo según contexto.
@@ -364,7 +366,39 @@ def generate_candidate(ctx: BoardContext,
                     if overlap_free(tmp, ctx.board_size):
                         pieces.append(q); cells_needed -= 1; break
 
+    if hard_blocks:
+        top_cell = column_cells[-1]
+        if all(not crosses_cell(p, *top_cell) for p in pieces if p.id != PLAYER_ID):
+            for _ in range(200):
+                pid = new_id()
+                q = random_piece(pid, ctx.board_size, lens_weights, dir_bias, rnd)
+                if crosses_cell(q, *top_cell) and q.len >= 3:
+                    tmp = pieces_copy(pieces) + [q]
+                    if overlap_free(tmp, ctx.board_size):
+                        pieces.append(q)
+                        break
+
     return pieces
+
+
+def blocker_metrics(pieces: List[Piece], ctx: BoardContext) -> Tuple[int, int]:
+    column_cells = set(ctx.path_cells_to_exit())
+    blocker_cells = 0
+    blocker_ids = set()
+    for p in pieces:
+        if p.id == PLAYER_ID:
+            continue
+        if p.dir == H:
+            for dx in range(p.len):
+                if (p.x + dx, p.y) in column_cells:
+                    blocker_cells += 1
+                    blocker_ids.add(p.id)
+        else:
+            for dy in range(p.len):
+                if (p.x, p.y + dy) in column_cells:
+                    blocker_cells += 1
+                    blocker_ids.add(p.id)
+    return blocker_cells, len(blocker_ids)
 
 def as_ts_level(id_str: str, pieces: List[Piece], difficulty: str, ctx: BoardContext) -> str:
     def piece_to_ts(p: Piece) -> str:
@@ -396,18 +430,22 @@ def make_levels(ctx: BoardContext,
                 max_bfs_states: int = 300000,
                 max_attempts: int = 10000,
                 progress_interval: int = 500,
-                target_moves: Optional[int] = None) -> List[str]:
+                target_moves: Optional[int] = None,
+                workers: int = 1,
+                hard_blocks: bool = False) -> List[str]:
     random.seed(seed)
     rng = random.Random(seed)
 
     out_ts_blocks: List[str] = []
     attempts = 0
     ctx_max_states = max_bfs_states
+    max_attempts_eff = max_attempts
     discard_counters = {
         "empty": 0,
         "trivial": 0,
         "unsolved": 0,
         "range": 0,
+        "heuristic": 0,
     }
 
     if target_moves is not None:
@@ -418,6 +456,13 @@ def make_levels(ctx: BoardContext,
         lw0, lw1, lw2 = lens_weights
         lens_weights = (lw0 + 1, max(1, lw1 - 1), lw2 + 1)
         ctx_max_states = int(ctx_max_states * 1.3)
+        if target_moves >= 24:
+            cover_top_cells = max(cover_top_cells, 4)
+            lens_weights = (lw0 + 2, max(1, lw1 - 2), lw2 + 2)
+            dir_bias = (dir_bias[0] * 0.85, dir_bias[1] * 1.15)
+            ctx_max_states = int(max_bfs_states * 1.8)
+            max_attempts_eff = int(max_attempts * 1.5)
+            hard_blocks = True or hard_blocks
 
     start_time = time.perf_counter()
 
@@ -437,7 +482,7 @@ def make_levels(ctx: BoardContext,
         msg = [
             f"PROGRESO {progress_pct:5.1f}%", \
             f"niveles {len(out_ts_blocks)}/{n_levels}", \
-            f"intentos {attempts}/{max_attempts}", \
+            f"intentos {attempts}/{max_attempts_eff}", \
             f"acierto {success_rate*100:4.2f}%", \
             f"t={elapsed:0.1f}s",
         ]
@@ -447,46 +492,69 @@ def make_levels(ctx: BoardContext,
             "descartes "
             f"vacío={discard_counters['empty']} "
             f"trivial={discard_counters['trivial']} "
+            f"heur={discard_counters['heuristic']} "
             f"sin_sol={discard_counters['unsolved']} "
             f"rango={discard_counters['range']}"
         )
         sys.stderr.write(" | ".join(msg) + "\n")
 
-    while len(out_ts_blocks) < n_levels and attempts < max_attempts:
-        attempts += 1
-        pieces = generate_candidate(ctx, num_pieces_range, cover_top_cells, lens_weights, dir_bias, rng=rng)
-        if not pieces:
-            discard_counters["empty"] += 1
-            log_progress()
-            continue
-        if is_goal(pieces, ctx):
-            discard_counters["trivial"] += 1
-            log_progress()
-            continue
-        # solver
-        res = solve_bfs(pieces, ctx, max_states=ctx_max_states)
-        if res is None:
-            discard_counters["unsolved"] += 1
-            log_progress()
-            continue
-        visited, moves = res
-        mcount = len(moves)
-        # filtra por dificultad
-        if not (min_moves <= mcount <= max_moves):
-            discard_counters["range"] += 1
-            log_progress()
-            continue
-        # ordena por id para consistencia visual
-        pieces_sorted = sorted(pieces, key=lambda p: (p.id != PLAYER_ID, p.id))
-        out_ts_blocks.append(
-            as_ts_level(
-                f"{level_prefix}{len(out_ts_blocks)+1:02d}",
-                pieces_sorted,
-                difficulty_label,
-                ctx,
-            )
+    def attempt_once(idx: int) -> Tuple[str, Optional[List[Piece]], Optional[int]]:
+        rnd = random.Random(seed + idx * 7919)
+        pcs = generate_candidate(
+            ctx,
+            num_pieces_range,
+            cover_top_cells,
+            lens_weights,
+            dir_bias,
+            rng=rnd,
+            hard_blocks=hard_blocks,
         )
+        if not pcs:
+            return "empty", None, None
+        if is_goal(pcs, ctx):
+            return "trivial", None, None
+
+        blocked_cells, blocker_ids = blocker_metrics(pcs, ctx)
+        if min_moves >= 20 or (target_moves and target_moves >= 20):
+            if blocked_cells < 3 or blocker_ids < 2:
+                return "heuristic", None, None
+
+        res = solve_bfs(pcs, ctx, max_states=ctx_max_states)
+        if res is None:
+            return "unsolved", None, None
+        visited, moves = res
+        if not (min_moves <= len(moves) <= max_moves):
+            return "range", None, visited
+        pcs_sorted = sorted(pcs, key=lambda p: (p.id != PLAYER_ID, p.id))
+        return "level", pcs_sorted, visited
+
+    def process_result(result: Tuple[str, Optional[List[Piece]], Optional[int]]) -> None:
+        nonlocal attempts
+        status, pcs, _visited = result
+        attempts += 1
+        if status == "level" and pcs is not None:
+            out_ts_blocks.append(
+                as_ts_level(
+                    f"{level_prefix}{len(out_ts_blocks)+1:02d}",
+                    pcs,
+                    difficulty_label,
+                    ctx,
+                )
+            )
+        elif status in discard_counters:
+            discard_counters[status] += 1
         log_progress()
+
+    if workers <= 1:
+        while len(out_ts_blocks) < n_levels and attempts < max_attempts_eff:
+            process_result(attempt_once(attempts + 1))
+    else:
+        with mp.Pool(processes=workers) as pool:
+            for res in pool.imap_unordered(attempt_once, range(1, max_attempts_eff + 1)):
+                process_result(res)
+                if len(out_ts_blocks) >= n_levels or attempts >= max_attempts_eff:
+                    pool.terminate()
+                    break
 
     log_progress(force=True)
     return out_ts_blocks
@@ -512,6 +580,8 @@ def parse_args():
     ap.add_argument("--max-attempts", type=int, help="Intentos máximos por lote de generación")
     ap.add_argument("--progress-interval", type=int, default=500, help="Intentos entre reportes de progreso (0=off)")
     ap.add_argument("--target-moves", type=int, help="Preset para sesgar hacia un número objetivo de movimientos")
+    ap.add_argument("--workers", type=int, default=1, help="Procesos paralelos para intentos (consume más CPU)")
+    ap.add_argument("--hard-blocks", action="store_true", help="Forzar bloqueos altos adicionales en la columna de salida")
     ap.add_argument("--outfile", type=str, default=None)
     return ap.parse_args()
 
@@ -541,6 +611,8 @@ if __name__ == "__main__":
         prof["max_bfs_states"] = args.max_bfs_states
     if args.max_attempts is not None:
         prof["max_attempts"] = args.max_attempts
+    hard_blocks = args.hard_blocks
+    workers = max(1, args.workers)
 
     ctx = BoardContext(
         board_size=prof["board_size"],
@@ -565,6 +637,8 @@ if __name__ == "__main__":
         max_attempts=prof.get("max_attempts", 10000),
         progress_interval=args.progress_interval,
         target_moves=args.target_moves,
+        workers=workers,
+        hard_blocks=hard_blocks,
     )
 
     out = []
